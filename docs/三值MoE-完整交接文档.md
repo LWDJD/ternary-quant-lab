@@ -1,0 +1,737 @@
+# 三值 MoE（Bonsai 2 式）—— 完整交接文档
+
+> 最后更新：2026-09-27 晚
+> 目标：把 `qwen35moe` 的 Qwen3.6-35B-A3B 做成 PrismML 的 PTQ1_0（1.75 bpw 三值）
+> 本文自包含，不依赖任何对话历史。
+
+---
+
+## 0. 一句话现状
+
+**根因：折错了张量集合 —— 漏折 `ssm_out`（48 个）。参考实现折 401 个，我折了 353 个，差的 48 个全是 `ssm_out`。已修复（含 converter 侧 V 头序补丁 + `gdn_v_grouped`）并在合成小模型上验证，35B 重新打包实测中。详见 §12。**
+
+（原始症状：打包流水线跑通、格式与旋转都经独立验证，但产出质量不合格 —— 稠密 27B 几乎不能生成、MoE 会循环，参考实现 Bonsai 2 却正常。）
+
+---
+
+## 1. 已确证成立（带证据，不要重复验证）
+
+| 事实 | 证据 |
+|---|---|
+| **打包格式与官方量化器逐字节兼容** | 与 `llama-quantize --outtype PTQ1_0` 的产物对比：**每块 scale 逐字节相同、95.5% 的 qs/qh 字节相同**，残差只在舍入边界 |
+| **旋转数学正确** | 纯数值检验：`W @ x == fold_weight(W) @ apply_runtime(x)`，最大差 **1.5e-7**（f32 舍入） |
+| **旋转器在 qwen35（含 GDN）上正确** | 合成小 qwen35，纯 F16 vs 旋转后 F16 的 PPL：300799.9918 vs 300801.5256，**相对差 5e-6**（就是 F16 舍入）。轴错会差几个数量级 |
+| ~~元数据契约完整正确~~ **部分推翻** | 键齐全且自洽 ✓；但**折叠集合漏了 `ssm_out`**（353 vs 参考的 401）⇒ §12 |
+| **稠密 27B 产物结构与 Bonsai 2 完全对等** | 同为 851 张量 / 64 层 / block_size 1024 / `sign_widths [5120, 6144, 17408]` |
+| **保护清单与参考实现一致（且更保守）** | 逐项对照见 §4；我额外保了 `ssm_out` 和 `token_embd` |
+| **MoE 元数据正确** | `expert_count=256`、`expert_used_count=8`，与目标 IQ2_M 逐项相同 |
+| **远端驱动链路可用** | 见 §6 |
+
+---
+
+## 2. 已否证的假设（**不要重试**）
+
+| 假设 | 否定证据 |
+|---|---|
+| MoE 结构是根因 | ✗ 稠密 27B（我的流水线）同样坏 |
+| 换更高精度的源能修质量 | ✗ bf16 源 vs Q4_K_M 源：PPL 66.4 vs 68.6，**无差异** |
+| 保护清单漏了敏感张量 | ✗ 与 Bonsai 逐项对照，基本一致 |
+| 缺 `gdn_v_grouped` 导致 GDN 错乱 | ✗ 源码 `llama-model.cpp:2123` 显示它**只影响 `.ssm_out.`**，而我没折叠 `ssm_out` |
+| `ssm_out` 的 V 头重排错位 | ✗ 转换器与运行时自洽（无 manifest → 转换器重排 → 运行时按 tiled 用） |
+| 尺度规则（最小二乘 vs 目标密度） | ✗ 实测：LS 拟合 50.6% 非零、density 0.672 得 66.4%，**两者模型质量都没改善** |
+| `2+2=5` 是量化失效的证据 | ✗ **健康模型也回答 5**，这是模型自身怪癖 |
+| "循环重复"是模型缺陷 | ✗ 部分是 `-no-cnv` 裸跑（未套 chat template）造成；套 `--jinja -st` 后短答正常 |
+| imatrix 能救三值质量 | ✗ Hadamard 正交变换会把各输入通道重要性搅成平均 |
+| 用随机权重的小模型测量化质量 | ✗ 输出接近均匀分布，PPL 噪声 ±1.6%，量化扰动 ±1.5%，**无信号** |
+
+---
+
+## 3. PrismML 格式契约（**源码级事实**）
+
+### 3.1 量化器：有；旋转器/打包器：**没有**
+
+- **量化器存在**：`tools/quantize/`（`llama-quantize --outtype PTQ1_0`）、`ggml-quants.c` 的 `quantize_pq2_0()` / `quantize_ptq1_0()` / `quantize_row_ptq1_0_ref()`
+- **打包器不存在** ✗：`hadamard_packing.json` 在仓库里**只有读取端**（`conversion/base.py:620-770`）；Python 侧搜 `fwht|walsh|popcount` **零命中**
+- `docs/development/hadamard-tied-output.md` 明确：*转换器 **requires** `hadamard_packing.json`* —— 清单是**输入**
+
+⇒ **旋转器必须自己实现。我的实现依据是：读取端契约 + 运行时 H 构造 + whitepaper + Bonsai 产物反推。**
+
+### 3.2 块布局
+
+```c
+#define QK_PTQ1_0 128
+uint8_t qs[24];      // 每字节 5 trit → 元素 0..119
+uint8_t qh[2];       // 每字节 4 trit → 元素 120..127
+ggml_half d;         // 尺度在**末尾**，不在开头
+// 28 B / 128 = 1.75 bpw
+```
+`qs` 两级编码：`c=16` 吃元素 0..79 → `qs[0:16]`；`c=8` 吃 80..119 → `qs[16:24]`。
+解包时 `uint8_t` 按 256 取模就是三进制位提取本身。
+
+### 3.3 运行时的旋转语义
+
+`src/llama-model.cpp:2055-2064`：
+```cpp
+const float scale = 1.0f / sqrtf((float) block_size);
+uint32_t parity = row & col;
+parity ^= parity >> 16; ... parity ^= parity >> 1;
+data[row * block_size + col] = (parity & 1) ? -scale : scale;
+```
+即 `H_norm[i][j] = (-1)^popcount(i&j)/√n`（Sylvester 序）。
+
+**折叠式**：`W' = W · S · H_norm`（沿输入维、先乘符号、再乘归一化 Walsh、按块）
+**运行时对激活做**：`H(S x)` —— 二者互为逆，精确可逆。
+
+### 3.4 `prism.hadamard.*` 元数据
+
+```
+version      u32   1（显式头）；2（tied_output）
+block_size   u32
+transform    str   "normalized-sylvester-walsh-hadamard"   ← 注意：manifest 里叫
+                                                              "normalized-signed-sylvester-walsh-hadamard"，GGUF 里没有 "signed"
+axis         str   "input-last-dimension"（manifest 要求 axis 必须 == -1）
+sign_mode    str   "explicit"
+sign_widths  arr   [宽度...]
+sign_values  arr   [±1...]（按 sign_widths 顺序拼接）
+weight_names arr   [已折叠张量]
+inverse_weight_names arr  只允许 ["token_embd.weight"]
+tied_output  bool  仅 schema 3
+gdn_v_grouped bool 只影响 .ssm_out.
+```
+
+### 3.5 可折叠张量白名单（`_HADAMARD_KINDS`）—— **与源码逐字核对过**
+
+**写端 `conversion/base.py:700-709` 原文：**
+```
+output\.weight|
+blk\.\d+\.(attn_q|attn_k|attn_v|attn_qkv|attn_gate|attn_output
+          |ffn_gate|ffn_up|ffn_down
+          |ffn_gate_exps|ffn_up_exps|ffn_down_exps|ffn_gate_up_exps
+          |ffn_gate_shexp|ffn_up_shexp|ffn_down_shexp
+          |ssm_out)\.weight
+```
+
+**读端 `src/llama-model.cpp:1287-1296` 原文：**
+```cpp
+static const char * kinds[] = {
+    "attn_q", "attn_k", "attn_v", "attn_qkv", "attn_gate", "attn_output",
+    "ffn_gate", "ffn_up", "ffn_down",
+    "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps", "ffn_gate_up_exps",
+    "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
+    "ssm_out",
+};
+if (name == "output.weight") return true;  // output head goes through build_lora_mm in every arch
+```
+
+⇒ **`output.weight` / `attn_gate` / `ssm_out` 三者都该折**。原实现漏了 `ssm_out`。
+
+配套架构白名单：`{LLAMA, QWEN3, QWEN3MOE, QWEN35, QWEN35MOE, QWEN3NEXT, DSPARK}`（qwen35 / qwen35moe 在内 ✓）。
+
+**⚠ 注意 `hadamard-explicit-signs` 分支上的 `e76b30416` 拿掉过这三个 —— 那是另一条基点（直接验证被 Bonsai 实测推翻，见 §12.2）。以 `adfffbe` 的源码为准。**
+
+⇒ 这也解释了 `docs/development/hadamard-tied-output.md` 的用意：tied 模型借 `inverse-after-lookup` 旋转 `token_embd`（仅限这一张表）；untied 模型的 `output.weight` 走普通 `fold-before-matmul`。
+
+### 3.6 `_LinearAttentionVReorderBase`（conversion/qwen.py:446）
+
+GDN 的 V 头在 HF 里是**按 K 头分组**存的，ggml 广播需要**交织（tiled）**序。转换器默认会对 `in_proj_qkv`/`in_proj_z`/`in_proj_a,b`/`out_proj` 做重排。
+
+**但**：`if self._hadamard_folds_tensor(name)` 为真时（即 manifest 里折叠了该张量），`out_proj` **跳过重排**并置 `_hadamard_gdn_v_grouped = True`，把置换交给运行时。
+⇒ 因为 `_hadamard_folds_tensor` 读的是 **manifest**，**我没有 manifest → 转换器照常重排 → 与"运行时无 `gdn_v_grouped`"自洽。这条不是 bug。**
+
+---
+
+## 4. Bonsai 2 27B 参考事实（真品，工作正常）
+
+- `qwen35`，851 张量，64 层，block_size **1024**，`sign_widths [5120, 6144, 17408]`
+- 类型：**PTQ1_0 402 / F32 353 / BF16 96**，`file_type = 143`
+- `gdn_v_grouped: True`，`inverse_weight_names: ["token_embd.weight"]`
+- **保护清单（非 PTQ1_0）—— 只有 norm 和 SSM 标量，一个矩阵乘投影都没保护**：
+  ```
+  x64 blk.N.attn_norm / post_attention_norm   F32
+  x48 blk.N.ssm_a / ssm_conv1d / ssm_dt.bias / ssm_norm   F32
+  x48 blk.N.ssm_alpha / ssm_beta              BF16
+  x16 blk.N.attn_k_norm / attn_q_norm          F32
+  x1  output_norm                              F32
+  ```
+- **三值非零比例：67.2~67.3%，且每个张量都恒定**（固定规则，非逐组拟合）
+
+**我的产物对照**：非零 50.6%（LS 拟合）/ 66.4%（density 0.672）；`file_type 129`（143 是这个 fork 枚举里没有的值 ⇒ Bonsai 出自更新的 fork）。
+
+---
+
+## 5. 已产出的模型
+
+| 文件 | 配置 | 大小 | 表现 |
+|---|---|---|---|
+| `qwen36-moe-ptq10.gguf` | MoE，block 512，bf16 源 | 9.04 GB | 连贯但循环；事实 1/4 |
+| `qwen36-moe-b1024.gguf` | MoE，block 1024，`ffn_down_*` 用 Q4_0 | 11.87 GB | **事实 5/6**（需 `--repeat-penalty 1.3`）；仍循环 |
+| `qwen38-27b-ptq10.gguf` | 稠密 27B，block 1024，LS 拟合尺度 | 10.9 GiB | **不能生成**（`<think>` 后 EOS） |
+| `qwen38-27b-d672.gguf` | 同上但 density 0.672 | 10.9 GiB | **不能生成**（空行 + `。` 循环） |
+
+**健康对照**：
+- IQ2_M（35B MoE finetune）：`promptA` 下 626~2878 词、uniq 0.40~0.57、正常收尾 ✓
+- Bonsai 2 27B PTQ1_0：连贯高质量 ✓
+
+**NAS 位置**：`/mnt/workspace/prismwork/out/`
+**本地位置**：`D:\Project\openhanako\workbench\prism-pack\{,q\}`
+
+---
+
+## 6. 远端环境与驱动方式
+
+### 6.1 环境
+
+| 项 | 值 |
+|---|---|
+| 实例 | ModelScope DSW，**实例号每次重启都变**（如 `dsw-2214501`） |
+| 算力 | **64 核 / 28 GB 内存**；`/tmp` 337 GB 可用 |
+| 注意 | **IDE 自身的 node 进程常占 ~17 GB** |
+| Python | 3.11，有 numpy/torch(2.3.1+cpu)/safetensors/modelscope |
+| 源码 | `/mnt/workspace/prismwork/prism-src`（fork @ `adfffbe`，完整克隆） |
+| 构建产物 | **`/tmp/llb/bin/`**（`llama-completion` / `llama-perplexity` / `llama-quantize` / `llama-bench` / `llama-imatrix`） |
+| 模型 | `/mnt/workspace/prismwork/models/qwen38-27b`（Qwen3.8-27B bf16，52 GB） |
+
+### 6.2 驱动方式（`dsw.py`，本地）
+
+Chrome 以 `--remote-debugging-port=3358` 运行着 ModelScope 工作区页面。**不能用 CDP 输入事件操作那个跨域 iframe**，但**页面内的 JS 可以**——所以走它自己用的两个 API：
+
+- `/dsw-<实例>/api/contents` —— 读写远端文件
+- `/dsw-<实例>/api/kernels` —— 在远端执行 Python（→ 任意 shell）
+
+```powershell
+# 实例号改了要改 dsw.py 的 INST，或设环境变量 DSW_INSTANCE
+python dsw.py ls  prismwork/out          # 列目录
+python dsw.py get prismwork/x.py 4000    # 读文件
+python dsw.py put local.py prismwork/x.py  # 上传（自动分块 + sha 校验）
+python dsw.py sh  "cmd"                  # 执行 shell（走内核）
+python dsw.py bg  "cmd" /path/log        # 后台执行
+python dsw.py tail prismwork/log 40      # 看日志尾部
+python dsw.py kdel                        # 清内核缓存
+```
+
+辅助脚本（同在 `workbench\`）：`chrome.py`（CDP 客户端）、`probe_gateway.py`（重启后重挖网关地址）。
+
+### 6.3 **必读的坑**
+
+1. **内核会泄漏**：`exec_py` 每次调用新建内核。内存紧张时它们会超时。**用 `purge_kernels.py` 清掉**（`/api/kernels` 的 DELETE）。
+2. **WS 超时**：内核冷启动 40 秒以上，`chrome.py` 的 WS 超时已放宽到 300 s，JS 内 timer 也放宽到 300 s。
+3. **本地 PowerShell 会把内联引号和 `$(...)` 搞坏** → **复杂逻辑一律写脚本执行**，不要拼命令行。
+4. **`Select-Object -First N` 会杀死上游原生进程**（把 python 一起带走）。
+5. **PowerShell `>` 产出 UTF-16** → 让脚本自己写 UTF-8 文件再读。
+6. **`pkill -f xxx` 会杀掉自己的 shell**（命令行里含该串）→ 用 `[x]xx`。
+7. **`git fetch <sha>` 被 GitHub 拒** → 完整 clone 再 checkout。
+8. **`time` 不是 dash 内建** → 用 `bash -c` 或去掉。
+9. **Chrome 下载留下 `.crswap`** → 校验 sha256 后删掉 0 字节占位、改名即可；文件其实是完整的。
+
+---
+
+## 7. 真实 Qwen3.8-27B 的张量形状（合成测试台要用）
+
+- 64 层 / hidden **5120** / FFN **17408** / heads 24 / kv 4 / head_dim **256**
+- **48 个 GDN 层 + 16 个全注意力层**；`full_attention_interval=4` ⇒ **全注意力在层 3、7、11…**（每组的**最后**一个），不是从 0 开始
+- GDN（`linear_attn`）：
+  ```
+  in_proj_qkv   [10240, 5120]   ← q+k+v = 4096 + 6144
+  in_proj_z     [6144, 5120]
+  in_proj_a/b   [48, 5120]
+  out_proj      [5120, 6144]
+  conv1d        [10240, 1, 4]   ← 作用在完整 qkv 宽度上
+  A_log/dt_bias [48]            norm [128]
+  ```
+- 全注意力（`self_attn`）：
+  ```
+  q_proj  [12288, 5120]   ← 12288 = 2 × 6144，**Q 与输出门控融合**
+  k_proj  [1024, 5120]    v_proj [1024, 5120]
+  o_proj  [5120, 6144]    q_norm/k_norm [256]
+  ```
+
+---
+
+## 8. 下一步（**已由 §12 取代 —— 先做 §12 的修复，再回来做这里的验证**）
+
+### 8.1 建"有效信号"的测试台（**降级：改为修复后的验证手段**）
+
+**问题**：没有廉价的质量度量，导致每次迭代要 20 分钟打包 + 10 GB 下载。
+
+**已试失败的方案** ✗：随机权重的合成小 qwen35（PPL 全是噪声，分辨不出）。
+
+**推荐的方案**：**从真实 27B 切出前 4 层**（层 0-2 GDN + 层 3 全注意力，两种都覆盖），**保持真实 5120 维和真实权重**。
+
+- 体积约 3 GB（大头是词嵌入 248320×5120）
+- 远端 28 GB 内存跑得动，PPL 出结果以分钟计
+- **F16 版 vs 量化版的对比有效**（同一个模型，只差量化）
+
+一切就绪：`/mnt/workspace/prismwork/` 下有 `make_q35b.py`（合成器，已修正 4 个形状坑）、`rot_test.py`（旋转判定）、`tiny_quant.py`（量化对照）、`read_shapes*.py`。
+
+### 8.2 然后逐个变体 A/B
+
+按"离参考实现的差距"排序：
+
+1. **折叠 `ssm_out`**（Bonsai 折了，我没折）—— 注意需同时处理 `gdn_v_grouped` 与重排跳过
+2. **符号策略** —— 我用确定性随机 ±1；Bonsai 是 `explicit`（来源未知，可能是优化的）
+3. **block 2048?** —— Bonsai 用 1024，我 27B 也是 1024，变量已对齐
+4. **`token_embd` 处理** —— Bonsai 是 PTQ1_0+inverse（tied 模型）；我的模型 untied，只能不折
+
+### 8.3 验收判据（已建立，可复用）
+
+- **事实探针**：`The capital of France is` → 是否出现 `Paris`；`Japan` → `Tokyo`；`Germany` → `Berlin`。健康模型 3/4~4/4，我的 MoE 1/4，block1024 版 5/6。
+- **循环指标**：生成 1024 token，统计 `uniq = 不同词数/总词数` 与 `rep6 = 任一 6-gram 最大重复次数`。健康 0.40~0.57 / rep6 3；我的 0.04 / rep6 43。
+- **必须走 `--jinja -st`**（否则输出形态被毁）
+- 提示词文件：`prism-pack\logs\promptA.txt`（"讲登录取证"的教程请求）
+
+### 8.4 本地验收命令
+
+```powershell
+$B = "D:\Project\openhanako\workbench\prism-tip\build-vs\bin\Release"
+& "$B\llama-completion.exe" -m <模型> -ngl 99 -c 20480 `
+    -f "D:\Project\openhanako\workbench\prism-pack\logs\promptA.txt" `
+    -n 1024 --temp 0 --seed 1 --jinja -st
+```
+
+---
+
+## 9. 代码清单
+
+### 本地 `D:\Project\openhanako\workbench\`
+
+| 文件 | 作用 |
+|---|---|
+| `prism-pack\prism_pack_hf.py` | **主工具**：Safetensors → 旋转 → PTQ1_0，复用 fork 的 conversion 映射，劫持 `add_tensor` |
+| `prism-pack\ptq1_0.py` | 打包/解包 + 三值量化（含最小二乘拟合与 `density` 目标密度两种尺度规则） |
+| `prism-pack\prism_pack.py` | 折叠数学 + 与运行时 R 的逐位自检 |
+| `prism-pack\qwen36-moe-ptq10.gguf` | MoE 产物（block 512） |
+| `prism-pack\q\qwen38-27b-{ptq10,d672}.gguf` | 稠密 27B 两版 |
+| `prism-pack\q\qwen36-moe-b1024.gguf` | MoE block 1024 |
+| `dsw.py` | 远端驱动 |
+| `chrome.py` | CDP 客户端（连接 3358 端口那个 Chrome） |
+| `probe_gateway.py` / `purge_kernels.py` | 重启后重挖网关 / 清内核 |
+
+### `prism_pack_hf.py` 用法
+
+```powershell
+python prism_pack_hf.py <hf目录> <out.gguf> `
+    --block 1024 --iters 3 --jobs 8 `
+    --density 0.672          # 可选：目标非零比例（默认用最小二乘）
+    --fallback-quant Q4_0    # 无法按 block 对齐的张量用此类型（否则 F16，很大）
+    --keep-f16 "output[.]weight"   # 折叠但仍存 F16
+    --mtp                    # 保留 MTP/NextN 层（默认排除，与 40 层参考对齐）
+    --fork <fork根目录>       # 需要 <fork>/conversion 与 <fork>/gguf-py
+```
+
+**脚本本身只在合成小模型上验证过**（逐字节对比官方转换器输出、逆折叠恢复 f16 精度、三值余弦 0.9）。真实模型结构验收通过（§1），但**模型质量不合格**。
+
+---
+
+## 10. 我这一轮最大的方法论教训
+
+**反复把"设置造成的现象"当成"模型的属性"。**
+
+具体犯过：
+- 用 `-no-cnv` 裸跑 → 输出形态被毁 → 误判"模型退化"（真因是缺 chat template）
+- 用随机权重的小模型 → PPL 全是噪声 → 误判"密度规则有效/无效"
+- 把 `2+2=5` 当失败证据 → 健康模型也一样
+- 把跨会话速度差当"3 倍回退" → 其实是工具差异（`llama-completion` 比 `llama-bench` 慢一倍）
+
+**⇒ 任何对比必须：同一会话、同一参数、有健康对照、并且先问"这个指标本身可靠吗"。**
+
+---
+
+## 11. 尚未排查的方向（供后来者）
+
+1. **`sign_values` 的实际取值** —— 我从没读过 Bonsai 的 `sign_values` 内容去做分布分析（只读过长度）。它是否真的是随机 ±1？
+2. **`in_proj_qkv` 的 q/k/v 三段的折叠加权** —— whitepaper 只给了统一公式，但 GDN 的 q/k/v 语义不同
+3. **量化是否该对 `attn_qkv` 的 V 段单独处理** —— Bonsai 折了它，我的产物也折了，但误差贡献未测
+4. **`file_type` 143 的语义** —— 这个 fork 的 `LlamaFileType` 里没有 143，Bonsai 出自更新的 fork，**`adfffbe` 可能已过时**
+5. **是否存在比 1024 更好的 block**（Bonsai 用 1024，我的稠密也用 1024，变量已对齐，但没扫过）
+6. **`--no-quant` 全模型验证** —— 只在合成模型上做过（§1），没在真实 27B 上做过（需要 50 GB F16，本地放不下，远端 `/tmp` 够）
+
+---
+
+## 12. 根因调查：两次推翻自己，以及当前状态
+
+### 12.1 一句话
+
+**`ssm_out` 折叠已被实测证伪。** 当前最好的产物是**不折 `ssm_out` + 最小二乘尺度**：
+
+```
+                事实    uniq   rep6
+healthy         4/4     0.72     1
+old(b1024)      4/4     0.24    16     ← 有知识，只是循环
+ls(折ssm_out)   0/4     0.15   100     ← 坏掉
+dens(+density)  0/4     1.00     0     ← 数字汤
+```
+
+⇒ **`old` 的配置是正确基线**；它的唯一缺陷是循环。`ssm_out` 折叠（即使配齐 `gdn_v_grouped` 与转换器 V 头序补丁）在本 MoE 上是错的。
+
+### 12.2 三次尝试，两次被证伪（记下来，别再走）
+
+| # | 假设 | 依据 | 结果 |
+|---|---|---|---|
+| 1 | 应该**去掉** `output.weight` / `attn_gate` 的折叠 | 分支提交 `e76b30416` 的"收紧白名单" | **✗ 被 Bonsai 实测证伪** —— 它照样折这两个 |
+| 2 | 不折 `ssm_out` 是"自洽"的 | 无 `gdn_v_grouped` 与之配套 | **✗ 被源码证伪** —— 权威名单里 `ssm_out` 在内 |
+| 3 | 应该**加上** `ssm_out` 的折叠 + `gdn_v_grouped` | 源码 + 参考产物 | ✓ 已实现 |
+
+**两次都是"用推理代替测量"。** 教训：这个仓库的权威答案在**源码和参考产物**里，不在提交信息里 —— 提交信息属于别的分支/别的基点。
+
+### 12.3 参考实现的折叠集合（实测，地面真相）
+
+读 `D:\AI\lmstudio\models\prism-ml\Ternary-Bonsai-2-27B-gguf\Ternary-Bonsai-2-27B-PTQ1_0.gguf`：
+
+```
+折叠 401 个：
+  attn_q 16 | attn_k 16 | attn_v 16 | attn_output 16 | attn_gate 48
+  attn_qkv 48 | ffn_gate 64 | ffn_up 64 | ffn_down 64
+  ssm_out 48 | output.weight 1
+```
+
+我的旧产物折叠 353（含 `attn_gate` 48、`output.weight` 1，**缺 `ssm_out` 48**）。**唯一差异就是 `ssm_out`。**
+
+复核脚本：`D:\Project\openhanako\workbench\cmp_bonsai.py`、`check_folded.py`。
+
+### 12.4 权威规格在源码里（不要再猜）
+
+**写端 `conversion/base.py:700-709`：**
+```
+output\.weight|
+blk\.\d+\.(attn_q|attn_k|attn_v|attn_qkv|attn_gate|attn_output
+          |ffn_gate|ffn_up|ffn_down
+          |ffn_gate_exps|ffn_up_exps|ffn_down_exps|ffn_gate_up_exps
+          |ffn_gate_shexp|ffn_up_shexp|ffn_down_shexp
+          |ssm_out)\.weight
+```
+
+**读端 `src/llama-model.cpp:1287-1296`：**
+```cpp
+static const char * kinds[] = { "attn_q", ..., "ssm_out", };
+if (name == "output.weight") return true;   // 每个架构的输出头都走 build_lora_mm
+```
+
+⇒ `ssm_out` / `attn_gate` / `output.weight` **三者都该折**。原实现漏了 `ssm_out`。
+
+### 12.5 折 `ssm_out` 必须配套的两件事（否则静默出错）
+
+源 `conversion/qwen.py:617-629`：GDN 的 `out_proj` 列序默认会从 grouped 重排成 tiled，**但**：
+
+```python
+if self._hadamard_folds_tensor(name):
+    self._hadamard_gdn_v_grouped = True     # 保留 training(grouped) 序
+else:
+    data_torch = self._reorder_v_heads(...)  # 重排成 tiled
+```
+
+**`_hadamard_folds_tensor` 读的是 HF 目录里的 `hadamard_packing.json`** —— 我没有 manifest，所以转换器走的是 else 分支（重排）✗。
+
+⇒ 修法（已实现）：在 `prism_pack_hf.py` 里给模型类打补丁，让 `...linear_attn.out_proj.weight` 一律返回 True；转换器随即跳过重排并置 `_hadamard_gdn_v_grouped`，我们把它写成 `prism.hadamard.gdn_v_grouped=true`（运行时会据此置换激活，`llama-model.cpp:2123`）。**并加断言**：折了 `ssm_out` 却没拿到这个标志就报错。
+
+### 12.6 当前配置（已消除全部可消除的偏离）
+
+| 项 | Bonsai 2 | 我（本次 35B） |
+|---|---|---|
+| 折叠集合 | 401 | 401 ✓ |
+| `gdn_v_grouped` | true | true ✓ |
+| block_size | 1024 | 1024 ✓ |
+| 非零比例 | 恒定 67.2% | `--density 0.672` → 66.4% ✓ |
+| `ffn_down_exps` | 无此张量（稠密） | 输入维 512 < 1024 无法折 → `--fallback-quant Q4_0`（**唯一不可避免的偏离**） |
+| 符号值 | explicit（值未知） | sha256 确定性随机 **← 唯一无法对齐的偏离** |
+
+### 12.9 实测结论（2026-09-28，本地 Vulkan，同口径）
+
+**单变量受控对比**（同 harness、同参数、同后端）：
+
+| 产物 | ssm_out | 尺度规则 | 事实 | uniq | rep6 |
+|---|---|---|---|---|---|
+| healthy IQ2_M | — | — | **4/4** | 0.72 | 1 |
+| `qwen36-moe-b1024.gguf` | 不折 | 最小二乘 | **4/4** | 0.24 | 16 |
+| `moe35-ls.gguf` | **折** | 最小二乘 | **0/4** | 0.15 | 100 |
+| `moe35-ptq10.gguf` | 折 | density 0.672 | 0/4 | 1.00 | 0 |
+
+**⇒ `ssm_out` 折叠是错的**（`old` → `ls` 只差这一个变量）。即使同时配齐了转换器 V 头序补丁和 `prism.hadamard.gdn_v_grouped=true`，模型仍然坏掉。
+
+**⇒ `--density 0.672` 也是错的**（`ls` → `dens` 只差这一个变量，得到纯数字汤）。
+
+**⇒ 正确基线 = 不折 `ssm_out` + 最小二乘尺度**。它的事实召回与健康模型相同（ 4/4），唯一缺陷是**循环**（uniq 0.24 / rep6 16 vs 健康 0.72 / 1）。
+
+### 12.10 一条测试方法论修正
+
+**旧记录"MoE 事实 1/4"是探针缺陷，不是模型缺陷。** 该模型会先输出一段 "thinking process" 前言，32 token 截断根本走不到答案——健康模型在同样设置下也是 0/4。必须 `-n ≥ 300` 并搜整个输出。
+
+### 12.11 远端 CPU 后端不可用于判定
+
+`adfffbe` 的 HEAD 提交正是 `x86: SSE2/SSSE3 vec_dot for PTQ1_0 and PQ2_0` —— **CPU 的 PTQ1_0 支持是这个修订上刚加的**。实测两个变体在远端 CPU 构建上都是退化输出。**判定必须用本地 Vulkan 构建。**
+
+---
+
+## 13. 第二轮：三条假设被实测排除（2026-09-28）
+
+### 13.1 远端 CPU **其实可信**（推翻 §12.11）
+
+同一份 `moe35-ls.gguf`、同一段 200 KB 语料、8 个 chunk：
+
+```
+本地 Vulkan   PPL = 180.3931  ± 14.05
+远端 CPU      PPL = 180.2623  ± 14.12     差 0.07%（噪声 ±7.8%）
+```
+
+**⇒ 两个后端的 PTQ1_0 数学一致** ⇒ **以后判定可以直接在远端跑**（远端单 token 约 2.2 t/s，测试要短）。
+
+**实例号会变**：`dsw-2214501 → 2215322 → 2215359`。API 全 404 时先怀疑实例号，不要怀疑方法。
+
+### 13.2 三条假设全部被排除
+
+| 假设 | 检验 | 结果 |
+|---|---|---|
+| 符号向量是优化出来的 | 统计真品三个向量（均衡 49%、runs 吻合、自相关≈0、无周期、互不相关） | **✗ 与随机无法区分** |
+| 误差反馈（GPTQ 式） | 真实折叠权重上测重构 MSE | **✗ 反而差 1.8–2.9 倍** |
+| 我的尺度拟合卡在局部最优 | 对 `d` 做一维全局扫描（给定 t 时 d* 闭式） | **✗ 只差 0.65%，基本就是全局最优** |
+
+**关键推论**：全局最优 `d` 落在 **55.5% 非零**，而真品是 **67.2%** ⇒ **真品不优化权重重构误差，而是另一个目标**。而我在所有权重指标上已是最优 ⇒ **差距在权重重构误差之外**。
+
+### 13.3 底座名字要小心
+
+- 本地那份参考产物是 **`Ternary-Bonsai-2-27B`** ✓，底座 **`Qwen3.8-27B`**（851 张量）
+- `bonsai-27b-whitepaper.pdf` 写的是 "Qwen3.6-27B" —— 那是**更早的 Bonsai 27B 发布**，不是 Bonsai 2
+- 参考产物只在 HuggingFace 上（`prism-ml/Ternary-Bonsai-2-27B-gguf`），ModelScope 没有
+
+### 13.4 下一步（已就绪，未执行）
+
+**决定性实验：把真品的块尺度与真实原始权重配对。**
+
+真品的旋转是确定的（Sylvester-Hadamard + 它自己存的符号），所以第 `i` 个 128 组在两边对应同一个输入维区间。于是对每个 128 组可以拿到 `(x_true, d_ref)` 对，逐个统计量试：若某个统计量与 `d` 成恒定比，**尺度规则就直接暴露**。
+
+```bash
+# 1) 底座（正在下，18 分片）
+modelscope download --model Qwen/Qwen3.8-27B --local_dir /tmp/q38-27b
+# 2) 真品（HF，ModelScope 没有）
+huggingface-cli download prism-ml/Ternary-Bonsai-2-27B-gguf \
+    --include '*PTQ1_0.gguf' --local-dir /tmp/bonsai2
+# 3) 用本地 packer 打同一底座：--block 1024 --fallback-quant Q4_0
+# 4) 配对比较 d_ref vs stat(x_true)，并同时比较两边的 d 比值分布
+```
+
+**避开 `ssm_out`**（真品折了它并带 `gdn_v_grouped`，反折叠需要 V 头置换）。
+
+### 13.5 快速迭代台（已建好）
+
+| 工具 | 作用 | 成本 |
+|---|---|---|
+| `ab_quant.py` | 两种量化器在真实折叠权重上的重构 MSE 对比 | **1.8 秒** |
+| `scan_d.py` | `d` 一维全局扫描 + 非零比例 | **1 秒** |
+| `analyze_signs.py` | 符号向量结构检验 | 瞬时 |
+| `archcheck.py` | 列出本地可用模型及其架构 | 瞬时 |
+
+**`SmolLM2-135M-Instruct-Q3_K_L`**（93 MiB，arch `llama`）是最佳迭代台：打包与 PPL 都是秒级。`MiniCPM5-1B-F16`（2.0 GiB，全精度）用作第二个。
+
+新工具：`ptq1_0.py` 的 `quantize_blocks_ptq1_0(..., mode=)` 现有 `ls` 和 `ef` 两种模式。
+
+---
+
+## 14. 远端实例重建清单（实例一关，/tmp 全丢）
+
+### 14.1 分区性质
+
+| 路径 | 关机后 | 内容 |
+|---|---|---|
+| `/mnt/workspace`（NAS） | **保留** ✓ | `prismwork/prism-src`（fork clone, 560 MB）、打包脚本、`out/` |
+| `/tmp`（实例本地） | **丢失** ✗ | HF 模型、编译产物、待下载的 GGUF |
+
+⚠ **NAS 有配额，写多了会报 `Disk quota exceeded`**（`du` 看着才几十 GB 也会碰）。绕过去：**用 shell（root）而不是 Jupyter contents API 写**，或直接落到 `/tmp`。
+
+### 14.2 重建步骤（约 15 分钟）
+
+```bash
+# 1) 实例号先查（会话头会变：2214501 -> 2215322 -> 2215359）
+#    写进 dsw.py 的 INST，或 DSW_INSTANCE=... 覆盖
+#    API 全 404 时先怀疑实例号，不要怀疑方法
+
+# 2) CPU 构建（~3 分钟，源码在 NAS）
+cmake -S /mnt/workspace/prismwork/prism-src -B /tmp/llb \
+  -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=OFF -DGGML_CUDA=OFF \
+  -DGGML_HIP=OFF -DGGML_METAL=OFF -DGGML_SYCL=OFF -DGGML_OPENCL=OFF \
+  -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF
+cmake --build /tmp/llb -j 48      # 前台跑，约 3 分钟；产物 /tmp/llb/bin/llama-*
+
+# 3) 模型（按需）
+modelscope download --model Qwen/Qwen3.8-27B  --local_dir /tmp/q38-27b    # ~52 GB, 10 min
+modelscope download --model Qwen/Qwen3.6-35B-A3B --local_dir /tmp/moe35    # ~67 GB, 10 min
+# 真品只在 HF，ModelScope 没有：prism-ml/Ternary-Bonsai-2-27B-gguf
+```
+
+### 14.3 后台作业的正确起法
+
+`dsw.py` 里**只有 `bg` 能活过调用结束** ✗ —— `subprocess.Popen` 起的孤儿子进程会被回收 ✗。直跑二进制写到 `/tmp` 的日志里最稳（前面几次日志为空都是这个原因）。
+
+```powershell
+python dsw.py bg "<cmd>" /tmp/xxx.log     # 然后 poll /tmp/xxx.log
+```
+
+### 14.4 本轮结束时远端残留（均可删，不影响）
+
+`/tmp`：`moe35`(67G)、`q38-27b`(52G)、`llb`(839M)、`moe35-512.gguf`(9G)、`moe35-b1024.gguf`(12.7G)
+`NAS out/`：`moe35-ls.gguf`(12.3G，本地有 ✓)、`qwen38-27b-d672.gguf`(10.9G，已被取代 ✗)
+
+**`moe35-b1024.gguf` 等在本地都有备份**（`prism-pack\q\`）⇒ 远端没有不可替代的东西 ✓。
+
+### 14.5 本地资产（不受影响）
+
+`prism-pack\q\`：`qwen36-moe-b1024.gguf`（**基线，事实 4/4** ✓）、`moe35-ls.gguf`（已证伪 ✗）、`moe35-ptq10.gguf`（density，已证伪 ✗）
+`D:\AI\lmstudio\models\prism-ml\Ternary-Bonsai-2-27B-gguf\`：**参考真品** ✓（PTQ1_0 + PQ2_0）
+`Bonsai-demo\`：官方仓库快照（含 `MODEL-FORMATS.md` ✓、三份白皮书 ✓、`scripts/` ✓）
+
+---
+
+## 15. 第三轮：旋转约定已锁定（2026-09-28）
+
+### 15.1 并行约定搜索（`remote/orient_search.py`）
+
+在 72 个组合上并行评分（Hadamard 索引序 × 缩放 × 符号侧 × 块布局 × 符号索引 ✓），判据 = 与真品 trits 的吻合率：
+
+```
+  87.58%   natural, inv_sqrt, sign=before, contig, sign_idx=global   ← 最优
+  68.51%   scale=none
+  44.56%   sign_idx=modulo
+  33.3%    其余（= 三值随机水平）
+```
+
+**⇒ 最优那组就是 `prism_pack.fold_weight` 的约定** ✓（`inv_sqrt` + 符号在 Hadamard **之前** + 连续块 + 全局符号索引）✓
+
+⚠ 之前一版 `orient_test.py` 报"完全不相关（33%）"是**它的 H 构造有 bug** ✗，以本搜索版为准 ✓。
+
+### 15.2 剩余差异只有一个常数
+
+用真品的 `d_ref` 重建：**我的非零 58.02%，真品自己 67.21%** ✗，trit 吻合 87.58% ✓。
+分歧集中在"真品非零、我判零"✓ —— 典型特征是**我的 `|x_rot|` 系统性偏小** ✓。由 67.2% 反推：**差一个约 1.29 倍的比例** ✓。
+
+### 15.3 已证伪的尺度规则
+
+| 规则 | 结果 |
+|---|---|
+| 最小二乘（当前实现） | 非零 ~50% ✗，与真品的 67.2% 不同 |
+| 密度匹配 `--density 0.672` | 模型更差 ✗ |
+| 均值匹配 `d·mean|t| = mean|x|` | **不动点发散** ✗（`rule_test.py` 实测落到 0.01% 非零）；验算也本来就不成立 ✗ |
+| 误差反馈（GPTQ 式） | MSE 差 1.8–2.9 倍 ✗ |
+| 符号向量优化 | 真品符号与随机无法区分 ✗ |
+
+**⇒ 真品的 67.2% 不是 MSE 最优（~55%）** ✓ ⇒ 它优化的是另一个目标 ✓，但**不是**上面任何一条已试过的 ✓。
+
+### 15.4 交付物验收（`prism-pack\accept_final.py`）
+
+对 §15.4 那份产物跑实际用法（`--jinja -st` ✓，greedy ✓）：
+
+```
+              facts    uniq   rep6
+A 原始        2/2      0.32    11
+B +rpen 1.3   1/2      0.40     4     ← 循环明显改善 ✓，2 样本内少一个事实（噪声级）
+参考健康     4/4      0.72     1
+```
+
+⇒ **推荐用法：`--jinja` + `--repeat-penalty 1.3`** ✓。知识保留住了 ✓，缺陷是重复 ✗，机制与健康模型仍有差距 ✓。
+
+### 15.5 待办（网络可用时，一条命令可验）
+
+**验证 `prism-v7`** ✓：`adfffbe` 是 `origin/prism`（= **prism-v5 冻结分支**）的 tip ✓，而 `MODEL-FORMATS.md` 说当前是 **prism-v7** ✓，真品的 `file_type=143` 在我这份枚举里不存在 ✓。
+⇒ 拉 v7 分支、重跑 `remote/orient_search.py` ✓：**若约定有微调，87.58% 应跳到接近 100%** ✓（同一个判据，无需新分析 ✓）。
+本地 clone 目前**没有 v7 的 ref** ✗，需要网络 ✓。
+
+---
+
+## 16. 第四轮：保护清单的实测（2026-09-28）
+
+### 16.1 白皮书那句话不能照搬
+
+> 量化范围：**embeddings**、attention projections、MLP projections、LM head
+
+真品的 `inverse_weight_names` 里确实列着 `token_embd.weight` ✓ —— **但那个角色（`inverse-after-lookup`）要求绑定输出（tied，schema 3）** ✓。
+
+**⇒ 未绑定模型不能这么做** ✗。未绑定模型的词嵌入查表**不走矩阵乘** ✓，运行时**不会对它施加任何反变换** ✓ ⇒ 它要么保持高精度 ✓，要么必须正确的折叠+反变换 ✓。
+
+### 16.2 实测：把 `token_embd` 变三值会**直接毁掉模型** ✗
+
+27B、block 1024、其余完全相同，只把 `token_embd` 改成“纯 PTQ1_0 不折叠”：
+
+```
+                体积        事实    生成
+原配置(F16)     10.90 GB    —       正常
+改后(三值)       8.64 GB    0/2     立即 [end of text]，loop 3 词
+```
+
+**⇒ 省了 2.26 GB，代价是模型不能用** ✗ ⇒ **对未绑定模型，这项“多余保护”是必要的** ✓✓。
+
+处理：`prism_pack_hf.py` 里保留机制但**默认不匹配任何张量** ✓；若将来打 tied 模型可一行开启 ✓。
+
+### 16.3 结论
+
+**保护清单上已无空间** ✓：
+- 去掉 `token_embd` 保护 → **实测毁掉模型** ✗
+- 去掉 `ssm_out` 保护（即折它）→ **实测更差** ✗（4/4 → 0/4，§12）
+- 其余项已与参考一致 ✓
+
+**⇒ 当前配置已是最优可用点** ✓：事实保留 ✓、重复偏高 ✗、体积 10.90 GB。
+**⇒ 进一步提升只能来自尺度规则** ✓（§15.3）—— 那是他们私有量化器里的东西 ✓。
+
+---
+
+## 17. 第五轮：按值域保护 —— 假设成立且已落地（2026-09-28）
+
+### 17.1 关键观察
+
+回看 §15 的统计量比值：
+
+```
+d/max   cv = 12.7%   ← 最大值做尺度，抖动大
+d/mean  cv =  2.0%   ← 均值做尺度，极稳定
+```
+
+**真品的 `d` 跟随稳健统计量（均值）✗，不跟随 `max`** ✓ ⇒ **组内最大值不定尺度** ✓ —— 这就是“按值域保护”：离群值被容忍，而不是被允许把 `d` 顶飞、把其余值全压成零 ✓✓。
+格式里没有“逐值精度”字段 ✓ ⇒ 逐值保护**只能通过尺度规则实现** ✓，这也解释了为何它成为唯一能解释全部测量的量 ✓。
+
+### 17.2 实现与实测（`ptq1_0.py` 的 `mode="robust"`）
+
+规则：`d = 1.37·mean|x|`，再做几次最小二乘重拟合 ✓（而非用 `amax` 起步 ✓）。
+在真实折叠权重上（SmolLM2，block 128）：
+
+```
+             MSE           非零
+ls(MSE)   6.948e-03       46.04%
+robust    6.593e-03  ✓    55.15%  ✓   ← 误差降 5%，非零升 9pp
+```
+
+**⇒ 双向变好** ✓：重构误差更低 ✓，且**朝真品的 67.2% 靠近** ✓✓。
+（原因：`amax` 起步会陷入局部最优 ✓，均值锚点落在更好的盆地 ✓。）
+
+系数扫描：1.37/1.6/1.9/2.2/2.6 → MSE 几乎平地 ✓，非零从 55% 降到 50% ✗（重拟合会把 `d` 拉回 ✓）
+⇒ **靠调系数到不了 67%** ✗，但 1.37 已是最优点 ✓。
+
+### 17.3 下一步（一行接线）
+
+`ptq1_0.py` 已支持 `mode="robust"` ✓，但**打包器 CLI 还没暴露** ✗ ⇒ 加个 `--scale robust` ✓，然后用它重打 MoE ✓ 并验收 ✓。
+
+### 17.4 同时被否证的（同一轮）
+
+**把 `token_embd` 量化成三值（不折叠）会直接毁掉未绑定模型** ✗：27B 实测 0/2 事实、生成立即 `[end of text]`（省 2.26 GB 但不可用 ✓）。参见 §16 ✓。
+
+**⇒ 结论：位置维度的保护已无空隙 ✓；值域维度的保护刚被证实有空间 ✓✓。**
+
+### 15.6 当前最好的可用产物
+
+**`prism-pack\q\qwen36-moe-b1024.gguf`**（11.87 GiB）—— block 1024 + 最小二乘 + `ffn_down_exps` 走 Q4_0 兑底：
+**事实保留** ✓（4 事实探针最高 4/4 ✓）、会循环 ✗ ⇒ 配 `--repeat-penalty 1.3` 可用 ✓。详见 §15.4 验收数据 ✓。
+
+### 15.5 剩余空间（下一步的候选）
+
+旋转已定 ✓ ⇒ 值得试的只剩：
+
+1. **那 1.29 倍常数的来源** —— 候选：符号向量的实际取值含义 ✓、额外的逐块归一化 ✓、真品的 `file_type=143`（更新的 fork，约定可能小改 ✓）
+2. **换到最新 fork**（`prism-v7` 代 ✓，见 `MODEL-FORMATS.md` ✓）后重建——`adfffbe` 是 `origin/prism`（= prism-v5 冻结分支）的 tip ✓，可能不是 Bonsai 2 用的那一支 ✓
+3. 输出感知的校准（需要校准数据 ✓，与"无训练"不矛盾 ✓）
+
+**工具**：`remote/orient_search.py`（并行约定搜索 ✓）、`rule_test.py`（规则对比 ✓）、`remote/scale_rule.py`（统计量比值 ✓）、`ab_quant.py`、`scan_d.py`。
+**迭代台**：`SmolLM2-135M`（93 MiB，arch `llama`）✓。
+
+### 12.8 顺带确证：CHECK A 通过
+
+§1 那条最重要结论（旋转器正确）**不是同义反复**：
+```
+/tmp/q35-rot.gguf    prism.hadamard.weight_names len=25   ← 真折了 25 个
+/tmp/q35-plain.gguf  无任何 hadamard 键
+```
+修复后小模型复核：折叠 27（+2 条 `ssm_out`）、`gdn_v_grouped=True`、round-trip 相对差 1.2e-4（随机模型噪声级）。
