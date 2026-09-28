@@ -1,0 +1,22 @@
+# credentials -- never commit
+gateway.txt
+gateway_cookies.txt
+cookie_header.txt
+dsw_kernel.txt
+*.token
+
+# artifacts
+*.gguf
+*.crswap
+*.safetensors
+*.part*
+
+# logs and scratch
+logs*/
+logs35/
+*.log
+debug*/
+
+# python
+__pycache__/
+*.pyc
