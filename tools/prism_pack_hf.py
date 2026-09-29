@@ -55,7 +55,7 @@ DEFAULT_FORK = HERE.parent / "prism-tip"
 #   mean67  -- d = 1.0668*mean|x|, plain round-to-nearest, NO refit; this is the
 #              only rule measured to reproduce the reference's constant 67.2%
 #              non-zero fraction, and it does so at a lower MSE than ls
-_SCALE_MULT = {"ls": 1.37, "robust": 1.37, "mean67": 1.0668, "ref": 1.40}
+_SCALE_MULT = {"ls": 1.37, "robust": 1.37, "mean67": 1.0668, "ref": 1.36645}
 
 # Tensors that get folded (rotated along the input dim).
 #
