@@ -107,7 +107,13 @@ _STAGE = ((0, 16, 0), (80, 8, 16))
 
 
 def quantize_blocks_ptq1_0(x: np.ndarray, iters: int = 3, density: float | None = None,
-                          mode: str = "ls", fb: float = 1.0, mean_mult: float = 1.37) -> bytes:
+                          mode: str = "ls", fb: float = 1.0, mean_mult: float = 1.37,
+                          theta: float = 0.38) -> bytes:
+    """Quantize rows of QK floats into PTQ1_0 blocks.
+
+    mode="mean67" wants mean_mult=1.0668 (d = 1.0668*mean|x|).
+    mode="ref" wants mean_mult=1.40, theta=0.38 -- see the branch below.
+    """
     """x: float32, shape (nblocks, 128) -> packed PTQ1_0 bytes for all blocks.
 
     mode chooses how the ternary codes are *chosen* (the scale rule follows):
@@ -135,10 +141,48 @@ def quantize_blocks_ptq1_0(x: np.ndarray, iters: int = 3, density: float | None 
     means setting d/2 to the (1-p) quantile of |x| within the group.
     """
     assert x.ndim == 2 and x.shape[1] == QK
-    assert mode in ("ls", "ef", "robust")
+    assert mode in ("ls", "ef", "robust", "mean67", "ref")
     nb = x.shape[0]
 
-    if mode == "robust":
+    if mode == "ref":
+        # Measured against the reference's own trits, with the fold at the right
+        # rotation block size (1024, not the 128 used for quantisation).
+        #
+        #   d     = mean_mult * mean|x|        (sets the reconstruction magnitude)
+        #   trit  = 0 if |x| < theta*d else sign(x)   (sets which trits survive)
+        #
+        # Sweeping both against the reference's trits shows agreement depends only
+        # on the product mean_mult*theta: every pair near 0.53*mean|x| scores the
+        # same 90.4%, while mean_mult alone changes nothing.  So the two knobs are
+        # orthogonal -- theta decides the trits, mean_mult decides their scale --
+        # and each had to be pinned separately.  mean_mult=1.40 comes from the
+        # reference's stored d (d/mean|x| = 1.398/1.397/1.411 on three tensors).
+        #
+        # The reference's non-zero fraction (67.2%) is reproduced at theta=0.38.
+        # Its shipped encoder instead uses d=amax with a 0.5*d boundary, which
+        # keeps only ~17% and scores at chance against its own released models.
+        d = np.maximum(np.float32(mean_mult) * np.abs(x).mean(axis=1),
+                       np.float32(1e-30)).astype(np.float32)
+        tq = np.where(np.abs(x) >= np.float32(theta) * d[:, None],
+                      np.sign(x), np.float32(0.0))
+        xi = tq.astype(np.int64) + 1
+    elif mode == "mean67":
+        # Scale anchored on the mean, plain round-to-nearest, NO refit.
+        #
+        # The reference holds a constant 67.2% non-zero on every tensor, and its
+        # d tracks mean|x| (cv 2.0%).  A threshold sweep on real folded weights shows
+        # that tau = 0.5334*mean|x| reproduces exactly 67.2% non-zero at MSE 0.975x,
+        # better than the least-squares optimum.  That is what d = 1.0668*mean|x|
+        # with an ordinary 0.5*d decision boundary gives, i.e. the refit in
+        # mode="robust" was pulling the scale (and the non-zero fraction) back.
+        #
+        # The reconstruction MSE is nearly flat over 42-69% non-zero, so this
+        # parameter is close to free: the reference is buying downstream quality at
+        # almost no distortion cost.
+        d = np.maximum(np.float32(mean_mult) * np.abs(x).mean(axis=1),
+                       np.float32(1e-30)).astype(np.float32)
+        xi = np.clip(np.rint(x / d[:, None]), -1.0, 1.0).astype(np.int64) + 1
+    elif mode == "robust":
         # Outlier-robust scale, then a least-squares refit.
         #
         # The reference's own statistics say its d tracks mean|x| (cv 2.0%) and NOT
