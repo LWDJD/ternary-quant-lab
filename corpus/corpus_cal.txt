@@ -1,0 +1,70 @@
+The capital of France is Paris, and the capital of Japan is Tokyo. Water is made of
+hydrogen and oxygen, and its chemical formula is H2O. The largest planet in the solar
+system is Jupiter, while the smallest is Mercury. Gold has the chemical symbol Au, and
+silver has Ag.
+
+In distributed systems, consensus protocols such as Raft and Paxos allow a cluster of
+machines to agree on a single value even when some nodes fail. The core difficulty is
+that messages can be delayed or reordered, and a node cannot distinguish a slow peer
+from a dead one. Practical systems therefore rely on quorums: a majority of nodes must
+acknowledge a decision before it is committed.
+
+Merkle trees let two parties compare large datasets efficiently. Each leaf holds a hash
+of a data block, and each internal node holds the hash of its children, so any change to
+a single block propagates to the root. Comparing roots therefore reveals whether two
+replicas agree, and a walk down the tree locates the first divergence.
+
+Public key cryptography rests on problems believed to be hard: factoring large integers,
+or computing discrete logarithms in certain groups. A signature scheme lets a holder of a
+private key produce a value that anyone with the public key can verify, without revealing
+the key itself. Elliptic curve constructions achieve the same security with much shorter
+keys.
+
+A hash function maps an arbitrary input to a fixed-size output. It must be collision
+resistant so that finding two inputs with the same digest is infeasible, and preimage
+resistant so that inverting it is infeasible. These properties underpin content
+addressing, where a file is named by the hash of its contents rather than by a location.
+
+Local language models trade memory bandwidth for quality. A transformer layer reads its
+weight matrices once per token, so decoding speed is limited by how fast those weights
+can be streamed from memory rather than by arithmetic throughput. This is why quantization
+matters: halving the bits per weight roughly halves the bytes that must cross the memory
+bus, and the arithmetic intensity of a matrix-vector product stays low.
+
+Quantization replaces each weight with a low-precision approximation. Uniform schemes
+store a scale per group of weights and round each value to the nearest level. Non-uniform
+schemes choose levels to match the distribution, and rotated schemes apply an orthogonal
+transform first so that the values become more uniform and easier to represent. The
+reconstruction error is usually measured as mean squared error, but downstream quality
+depends on how the error interacts with the activations.
+
+A mixture of experts layer replaces one large feed-forward network with several smaller
+ones plus a router. Each token is routed to a few experts, so the parameter count grows
+while the compute per token stays roughly constant. The trade is memory: all experts must
+reside somewhere, even though only a few are touched per token.
+
+Tidal forces arise because gravity weakens with distance, so the near side of a body
+feels a stronger pull than the far side. This differential stretches the body along the
+line joining it to the primary and compresses it perpendicular to that line. The Moon is
+tidally locked to Earth for the same reason: the torque from the tidal bulge removed its
+rotation relative to us long ago.
+
+Fermentation predates written history. Yeast converts sugars into ethanol and carbon
+dioxide in the absence of oxygen, which is why bread rises and beer contains alcohol. The
+pathway is less efficient than respiration but does not require oxygen, so it remains
+useful when oxygen is scarce.
+
+The alphabet was not invented once. Writing systems arose independently in Mesopotamia,
+Egypt, China, and Mesoamerica, and each began with pictographic marks that gradually
+became conventional. The step from logographic signs to signs for sounds was the decisive
+one, because it reduced the number of symbols a scribe had to learn.
+
+Light travels at a fixed speed in vacuum, and that constancy is what forces time dilation.
+Two observers moving relative to each other disagree about which events are simultaneous,
+and each measures the other's clock as running slow. The effect is negligible at everyday
+speeds but becomes dominant for particles moving near the speed of light.
+
+The immune system distinguishes self from non-self using a combination of innate and
+adaptive mechanisms. Innate responses are fast and generic, recognizing broad molecular
+patterns. Adaptive responses are slow and specific, and they retain a memory of past
+encounters, which is the principle behind vaccination.
