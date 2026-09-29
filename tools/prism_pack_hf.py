@@ -49,6 +49,14 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 DEFAULT_FORK = HERE.parent / "prism-tip"
 
+# Scale-rule coefficient, in units of mean|x| per block.
+#   ls      -- alternating least squares (max-initialised); the refit drives d
+#   robust  -- d = 1.37*mean|x| then one refit
+#   mean67  -- d = 1.0668*mean|x|, plain round-to-nearest, NO refit; this is the
+#              only rule measured to reproduce the reference's constant 67.2%
+#              non-zero fraction, and it does so at a lower MSE than ls
+_SCALE_MULT = {"ls": 1.37, "robust": 1.37, "mean67": 1.0668, "ref": 1.40}
+
 # Tensors that get folded (rotated along the input dim).
 #
 # `token_embd` is deliberately absent: it is untied here and cannot be folded.
@@ -148,12 +156,28 @@ def main() -> int:
                     help="fraction of trits to keep non-zero, e.g. 0.672 to match "
                          "PrismML's own packer.  Omit to use the least-squares scale, "
                          "which zeroes ~50.6%% -- about 17 points more than the reference.")
-    ap.add_argument("--scale", default="ls", choices=("ls", "robust"),
+    ap.add_argument("--scale", default="ls", choices=("ls", "robust", "mean67", "ref"),
                     help="ls = max-initialised alternating least squares (default).  "
                          "robust = outlier-robust: d = 1.37*mean|x| then refit.  The "
                          "reference's d tracks mean|x| (cv 2.0%%) not max|x| (cv 12.7%%), "
                          "and on real folded weights robust measures 0.949x MSE and "
                          "55.2%% non-zero vs 46.0%% -- better AND closer to its 67.2%%.")
+    ap.add_argument("--theta", type=float, default=0.38,
+                    help="decision boundary as a fraction of d, for --scale ref.  "
+                         "0.5 is ordinary round-to-nearest; the reference measures "
+                         "0.38, which is what keeps its non-zero fraction at 67.2%%.")
+    ap.add_argument("--signs-from", default=None, metavar="DIR",
+                    help="directory of sign_<width>.npy to use instead of generating "
+                         "random ones.  Required to compare bytes against a reference "
+                         "pack: a different sign vector gives a completely different "
+                         "(but equally valid) rotation, so the trits are unrelated.")
+    ap.add_argument("--config-a", action="store_true",
+                    help="Reference configuration for the GDN layers: fold ssm_out too "
+                         "AND keep the training (grouped) V order, so the runtime "
+                         "permutes the activation.  The reference ships "
+                         "gdn_v_grouped=true with ssm_out folded; without this flag the "
+                         "packer skips ssm_out and lets the converter do its normal "
+                         "grouped->tiled column reorder.")
     ap.add_argument("--fallback-quant", default=None, metavar="TYPE",
                     help="GGML type name (e.g. Q4_0) for tensors the fold set targets "
                          "but that cannot be folded at this block size (ffn_down_* at "
@@ -201,10 +225,22 @@ def main() -> int:
         cls.opt_num_mtp_layers = getattr(cls, "opt_num_mtp_layers", 0)
         print(f"  mtp: {'included' if args.mtp else 'excluded (matches the 40-block reference)'}")
 
-    # NOTE: the converter patch that kept the grouped V order is deliberately NOT
-    # applied.  It is only correct when ssm_out is folded; with ssm_out skipped it
-    # would leave out_proj in grouped order while everything else is tiled, which
-    # breaks the model.  Keep the converter's default behaviour.
+    # The converter decides whether to keep the grouped V order by asking
+    # hadamard_folded_names(), which normally reads hadamard_packing.json -- a file
+    # only their private quantizer can produce.  --config-a stands in for it: naming
+    # the out projection is enough to select the grouped path, because the fold is
+    # applied to every layer's ssm_out (so matching by kind is correct here, not the
+    # bug the fork warns about).
+    if args.config_a:
+        from conversion.base import ModelBase  # noqa: PLC0415
+        _orig_names = ModelBase.hadamard_folded_names
+
+        def _names_with_out_proj(self):
+            return set(_orig_names(self)) | {"linear_attn.out_proj.weight"}
+
+        ModelBase.hadamard_folded_names = _names_with_out_proj
+        print("  config A: folding ssm_out and asking the converter to keep the "
+              "grouped V order")
 
     # MOSTLY_F16 makes the base loop hand us un-quantized f16/f32 arrays; the
     # base would otherwise quantize by itself and we would have to undo it.
@@ -234,7 +270,9 @@ def main() -> int:
             if f.size % Q.QK:
                 raise ValueError(f"{f.size} elements is not a multiple of {Q.QK}")
             return Q.quantize_blocks_ptq1_0(f.reshape(-1, Q.QK), args.iters,
-                                            density=args.density, mode=args.scale)
+                                            density=args.density, mode=args.scale,
+                                            mean_mult=_SCALE_MULT.get(args.scale, 1.37),
+                                            theta=getattr(args, "theta", 0.38))
 
         n = arr.shape[0] if arr.ndim else 1
         if args.jobs <= 1 or n < 2 * args.jobs:
@@ -265,7 +303,7 @@ def main() -> int:
         ne0 = int(arr.shape[-1]) if arr.ndim else 0
         keep16 = args.keep_f16 is not None and re.fullmatch(args.keep_f16, name) is not None
         targets_fold = (FOLDABLE.fullmatch(name) is not None
-                        and SKIP_FOLD.fullmatch(name) is None)
+                        and (args.config_a or SKIP_FOLD.fullmatch(name) is None))
         do_fold = targets_fold and ne0 > 0 and ne0 % args.block == 0
 
         # Quantize without rotating: tensors the reference also quantizes, but whose
@@ -306,7 +344,13 @@ def main() -> int:
             return orig_add(name, data, raw_shape=raw_shape, raw_dtype=raw_dtype)
 
         if ne0 not in signs_cache:
-            signs_cache[ne0] = sign_vector(ne0)
+            loaded = None
+            if args.signs_from:
+                cand = Path(args.signs_from) / f"sign_{ne0}.npy"
+                if cand.is_file():
+                    loaded = np.load(cand).astype(np.float32)
+                    print(f"  sign for width {ne0}: loaded {cand.name}")
+            signs_cache[ne0] = loaded if loaded is not None else sign_vector(ne0)
         w = arr.astype(np.float32)
         stats["in_bytes"] += w.nbytes
         del w
